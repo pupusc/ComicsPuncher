@@ -33,7 +33,17 @@ pip install requests jmcomic
 
 ---
 
-### 4. Linux 平台部署 (服务器挂机)
+### 4. GitHub Action 
+配置好如下secret即可运行
+PICA_USER  pica账号
+PICA_PW    pica密码
+JM_USER    JM账号
+JM_PW      JM密码
+MY_PROXY    代理（可不配置）
+
+---
+
+### 5. Linux 平台部署 (服务器挂机)
 
 建议将脚本部署在海外 VPS（如腾讯云轻量香港、AWS、搬瓦工等），可省去代理配置。
 
