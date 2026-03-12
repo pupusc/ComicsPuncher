@@ -10,11 +10,11 @@ logging.basicConfig(
 
 # --- 用户配置区 ---
 # 优先从环境变量读取 (用于 GitHub Actions)，否则使用默认值
-PICA_USER = os.getenv("PICA_USER", "pupusc")
-PICA_PW = os.getenv("PICA_PW", "..52t1314..")
+PICA_USER = os.getenv("PICA_USER")
+PICA_PW = os.getenv("PICA_PW")
 
-JM_USER = os.getenv("JM_USER", "pupusc")
-JM_PW = os.getenv("JM_PW", "..52t1314..")
+JM_USER = os.getenv("JM_USER")
+JM_PW = os.getenv("JM_PW")
 
 MY_PROXY = os.getenv("MY_PROXY", "")  # 例如 "127.0.0.1:7890"
 # ----------------
