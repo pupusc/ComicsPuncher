@@ -2,6 +2,7 @@
 原项目地址
 https://github.com/RahabHub/ComicsPuncher
 修改成可使用Action定时运行
+JM添加每日打卡
 
 ### 4. GitHub Action 
 ---
