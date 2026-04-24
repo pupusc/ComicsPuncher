@@ -20,12 +20,16 @@ class JmPuncher:
             option = JmOption.construct(
                 {
                     "client": {
-                        "impl": "html",  # 使用 HTML 客户端
+                        "impl": "html",
                         "username": self.username,
                         "password": self.password,
                         "proxies": {"http": self.proxy, "https": self.proxy}
                         if self.proxy
                         else None,
+                        "postman_conf": {
+                            "impersonate": "chrome110",
+                            "verify": False
+                        }
                     }
                 }
             )
@@ -34,12 +38,11 @@ class JmPuncher:
             logging.info(f"正在尝试登录 JM (用户: {self.username})...")
             # 登录接口返回的数据包含完整用户信息
             resp = client.login(self.username, self.password)
-            user_data = resp.res_data
-
+            login_data = json.loads(resp.content)
             logging.info("=" * 20)
+            logging.info(f"用户信息: {login_data}")
             logging.info("🎉 JM 登录活跃成功！")
-            logging.info(f"用户名: {user_data.get('username')}")
-            logging.info(f"金币余额: {user_data.get('coin')}")
+
             logging.info("=" * 20)
 
             # 使用 HTML 客户端的 get_jm_html 方法访问签到页面
