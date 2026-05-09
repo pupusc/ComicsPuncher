@@ -8,11 +8,10 @@ from jmcomic import JmOption
 
 # ---- 网络容错配置 ----
 REQUEST_TIMEOUT = 25  # 单次请求超时（秒）
-MAX_RETRIES = 3  # 应用层重试次数
-RETRY_BACKOFF_BASE = 2  # 重试退避基数（秒），实际延迟 = base * (2 ** n) ± jitter
+MAX_RETRIES = 3  # 应用层重试次数（仅对可重试错误生效）
+RETRY_BACKOFF_BASE = 2  # 重试退避基数（秒）
 
 # 预置禁漫域名，用于动态域名解析失败时的回退
-# 当 jm365.work 重定向服务不可达时，直接用这些域名
 FALLBACK_HTML_DOMAINS = [
     "18comic.vip",
     "18comic.org",
@@ -23,16 +22,25 @@ FALLBACK_API_DOMAINS = [
     "www.cdngwc.net",
 ]
 
+# HTTP 403/401 为永久性拒绝，重试无意义
+_NON_RETRYABLE_KEYWORDS = ("403", "401", "Forbidden", "Unauthorized")
+
+
+def _is_retryable(error_msg: str) -> bool:
+    """判断错误是否可以重试。403/401 等拒绝类错误不应重试。"""
+    msg = str(error_msg)
+    return not any(kw in msg for kw in _NON_RETRYABLE_KEYWORDS)
+
 
 def _retry_with_backoff(func, max_retries=MAX_RETRIES):
-    """带指数退避的重试包装器"""
+    """带指数退避的重试包装器，403/401 等拒绝类错误立即抛出"""
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
             return func()
         except Exception as e:
             last_exc = e
-            if attempt == max_retries:
+            if attempt == max_retries or not _is_retryable(str(e)):
                 raise
             delay = RETRY_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1)
             logging.warning(
@@ -42,13 +50,58 @@ def _retry_with_backoff(func, max_retries=MAX_RETRIES):
     raise last_exc  # unreachable
 
 
+def _resp_status(resp) -> int:
+    """兼容 jmcomic 不同客户端返回的响应对象，统一获取 HTTP 状态码。
+
+    HTML 客户端返回 requests.Response (有 .status_code)，
+    API 客户端返回 JmApiResp (状态码在 .resp.status_code)。
+    """
+    if hasattr(resp, 'status_code'):
+        return resp.status_code
+    if hasattr(resp, 'resp') and hasattr(resp.resp, 'status_code'):
+        return resp.resp.status_code
+    return -1
+
+
+def _resp_cookies(resp) -> dict:
+    """兼容获取响应的 cookies 字典。"""
+    if hasattr(resp, 'cookies'):
+        return dict(resp.cookies)
+    if hasattr(resp, 'resp') and hasattr(resp.resp, 'cookies'):
+        return dict(resp.resp.cookies)
+    return {}
+
+
+def _resp_text(resp) -> str:
+    """兼容获取响应文本。"""
+    if hasattr(resp, 'text'):
+        return resp.text
+    if hasattr(resp, 'resp') and hasattr(resp.resp, 'text'):
+        return resp.resp.text
+    return ""
+
+
+def _resp_json(resp):
+    """兼容解析响应 JSON。"""
+    try:
+        if hasattr(resp, 'json'):
+            return resp.json()
+        if hasattr(resp, 'resp'):
+            return resp.resp.json()
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
 class JmPuncher:
     """
     禁漫天堂自动签到类
-    基于 jmcomic 库实现，具备多策略回退和网络容错能力：
+
+    三层策略回退（GitHub Actions 环境下策略1大概率被 Cloudflare 拦截，
+    策略2使用移动端API域名通常可以绕过）：
       - 策略1: HTML 网页端（curl_cffi 指纹伪装）
-      - 策略2: API 移动端（独立域名，可能绕过部分封锁）
-      - 策略3: 直接 HTTP 请求（绕过 jmcomic 域名解析，兜底方案）
+      - 策略2: API 移动端（独立域名，Cloudflare 防护较宽松）
+      - 策略3: 直接 HTTP 请求（兜底方案）
     """
 
     def __init__(self, username, password, proxy=None):
@@ -77,71 +130,102 @@ class JmPuncher:
     # ===== 策略1: HTML 网页端 =====
     def _try_html_client(self):
         client = self._build_client(impl="html", fallback_domains=FALLBACK_HTML_DOMAINS)
-        self._do_login(client, impl_label="HTML")
-        self._do_sign(client)
+        self._do_login(client)
+        self._do_sign_via_html_client(client)
 
     # ===== 策略2: API 移动端 =====
     def _try_api_client(self):
+        # API 客户端使用移动端域名（通常 Cloudflare 防护较宽松）
         client = self._build_client(impl="api", fallback_domains=FALLBACK_API_DOMAINS)
-        self._do_login(client, impl_label="API")
-        self._do_sign(client)
+        self._do_login(client)
+        # API 客户端没有 get_jm_html 方法，登录后直接用 HTTP 请求签到
+        self._do_sign_via_direct_http(client)
 
-    # ===== 策略3: 直接 HTTP 请求（绕过 jmcomic 域名检测） =====
+    # ===== 策略3: 直接 HTTP 请求 =====
     def _try_direct_http(self):
         logging.info("使用直接 HTTP 请求进行签到...")
+        self._do_sign_via_direct_http(client=None)
+
+    # ===== 签到实现 =====
+
+    def _do_sign_via_html_client(self, client):
+        """通过 HTML 客户端签到（仅策略1使用）"""
+        logging.info("正在执行禁漫签到...")
+
+        def sign_action():
+            return client.get_jm_html("/ajax/user_daily_sign", timeout=REQUEST_TIMEOUT)
+
+        resp = _retry_with_backoff(sign_action)
+        self._parse_and_handle_sign_result(resp)
+
+    def _do_sign_via_direct_http(self, client):
+        """
+        使用直接 HTTP 请求签到（策略2和策略3共用）。
+        策略2: 从已登录的 API 客户端提取 cookies，带到请求中
+        策略3: 不依赖客户端，独立登录+签到
+        """
         import requests as req
 
         session = req.Session()
         if self.proxy:
             session.proxies = {"http": self.proxy, "https": self.proxy}
 
-        # 遍历候选域名尝试登录
-        domain = self._resolve_working_domain(session)
-        if not domain:
-            raise RuntimeError("无法连接到任何禁漫域名")
+        # 从已登录的客户端提取 cookies（策略2场景）
+        if client is not None:
+            try:
+                client_cookies = client.get_meta_data('cookies') or {}
+                for k, v in client_cookies.items():
+                    session.cookies.set(k, v)
+                logging.info("已从API客户端加载登录cookies")
+            except Exception:
+                pass
 
-        # 登录
-        resp = session.post(
-            f"https://{domain}/login",
-            data={
-                "username": self.username,
-                "password": self.password,
-                "id_remember": "on",
-                "login_remember": "on",
-                "submit_login": "",
-            },
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=False,
-        )
+        # 如果拿不到有效 cookies（策略3场景），需要先登录
+        if not session.cookies:
+            logging.info("需要先执行登录...")
+            domain = self._resolve_working_domain(session)
+            if not domain:
+                raise RuntimeError("无法连接到任何禁漫域名")
 
-        if resp.status_code != 200:
-            raise RuntimeError(f"直接HTTP登录失败，HTTP {resp.status_code}")
+            resp = session.post(
+                f"https://{domain}/login",
+                data={
+                    "username": self.username,
+                    "password": self.password,
+                    "id_remember": "on",
+                    "login_remember": "on",
+                    "submit_login": "",
+                },
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=False,
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"登录失败，HTTP {resp.status_code}")
+            if not any(k in dict(resp.cookies) for k in ("remember_id", "remember", "yuo1", "AVS")):
+                raise RuntimeError("登录失败，未获取到有效会话 Cookie")
+            logging.info("直接HTTP登录成功")
 
-        cookies = dict(resp.cookies)
-        if not any(k in cookies for k in ("remember_id", "remember", "yuo1", "AVS")):
-            raise RuntimeError("直接HTTP登录失败，未获取到有效会话 Cookie")
+        # 使用 API 域名做签到 - 因为网页域名可能被 Cloudflare 拦截
+        # API 域名通常与网页端共享认证 Cookie
+        sign_domain = self._resolve_working_domain(session)
+        if not sign_domain:
+            raise RuntimeError("无法连接到签到域名")
 
-        logging.info("直接HTTP登录成功")
-
-        # 签到
         sign_resp = session.get(
-            f"https://{domain}/ajax/user_daily_sign",
+            f"https://{sign_domain}/ajax/user_daily_sign",
             timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "X-Requested-With": "XMLHttpRequest",
+            },
         )
+        self._parse_and_handle_sign_result(sign_resp)
 
-        try:
-            data = sign_resp.json()
-        except json.JSONDecodeError:
-            logging.warning(f"签到响应非 JSON: {sign_resp.text[:200]}")
-            print("签到状态未知，请检查日志")
-            return
-
-        self._handle_sign_result(data)
-
-    def _resolve_working_domain(self, session, timeout=10):
-        """按优先级检测可连通的域名"""
+    def _resolve_working_domain(self, session, timeout=8):
+        """按优先级检测可连通的域名，返回第一个返回200的域名"""
         candidates = FALLBACK_HTML_DOMAINS + FALLBACK_API_DOMAINS
-        # 去重并保持顺序
         seen = set()
         candidates = [d for d in candidates if not (d in seen or seen.add(d))]
 
@@ -160,16 +244,50 @@ class JmPuncher:
 
         return None
 
-    # ===== 公共方法 =====
+    def _parse_and_handle_sign_result(self, resp):
+        """解析签到响应并处理结果"""
+        text = _resp_text(resp)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            logging.warning(f"签到响应非 JSON: {text[:200]}")
+            print("签到状态未知，请检查日志")
+            return
+
+        self._handle_sign_result(data)
+
+    def _handle_sign_result(self, data):
+        if not isinstance(data, dict):
+            print(f"签到状态未知: {data}")
+            return
+
+        if data.get("error") == "finished":
+            logging.info("今日已签到，无需重复签到")
+            print("签到结果: 今日已签到")
+
+        elif data.get("errorMsg") == "Not legal.ajax":
+            logging.error("签到失败: AJAX 验证未通过，可能登录态已失效")
+            print("签到失败: 登录验证未通过")
+
+        elif "msg" in data:
+            msg = data["msg"]
+            logging.info(f"禁漫签到成功: {msg}")
+            print(f"签到结果: {msg}")
+
+        else:
+            logging.info(f"签到响应: {data}")
+            print(f"签到状态: {data}")
+
+    # ===== 客户端构建 =====
+
     def _build_client(self, impl, fallback_domains):
         """构建 jmcomic 客户端，优先动态域名解析，失败则用预置域名"""
-
         postman_type = self._detect_postman_type()
         logging.info(f"使用 {postman_type} 作为 HTTP 后端")
 
         meta_data = {"timeout": REQUEST_TIMEOUT}
         if postman_type == "curl_cffi":
-            meta_data["impersonate"] = "chrome110"
+            meta_data["impersonate"] = "chrome124"
 
         if self.proxy:
             meta_data["proxies"] = {"http": self.proxy, "https": self.proxy}
@@ -177,7 +295,7 @@ class JmPuncher:
         base_config = {
             "client": {
                 "impl": impl,
-                "retry_times": MAX_RETRIES,
+                "retry_times": 1,  # jmcomic 内部重试次数，减少无意义重试
                 "postman": {
                     "type": postman_type,
                     "meta_data": meta_data,
@@ -191,12 +309,11 @@ class JmPuncher:
             return option.build_jm_client()
         except Exception as e:
             logging.warning(f"动态域名解析失败 ({e})，回退到预置域名: {fallback_domains}")
-            # 用预置域名重新构建
             fallback_config = {
                 "client": {
                     "impl": impl,
                     "domain": fallback_domains,
-                    "retry_times": MAX_RETRIES,
+                    "retry_times": 1,
                     "postman": {
                         "type": postman_type,
                         "meta_data": meta_data,
@@ -206,65 +323,24 @@ class JmPuncher:
             option = JmOption.construct(fallback_config)
             return option.build_jm_client()
 
-    def _do_login(self, client, impl_label=""):
-        label = f"[{impl_label}] " if impl_label else ""
-        logging.info(f"{label}正在登录禁漫 (用户: {self.username})...")
+    # ===== 登录 =====
+
+    def _do_login(self, client):
+        logging.info(f"正在登录禁漫 (用户: {self.username})...")
 
         def login_action():
             resp = client.login(self.username, self.password)
-            if resp.status_code != 200:
-                raise RuntimeError(f"登录失败，HTTP {resp.status_code}")
-            cookies = dict(resp.cookies)
+            status = _resp_status(resp)
+            if status not in (200, -1):
+                # -1 表示无法获取状态码（可能是 JmApiResp，由下层保证正确性）
+                raise RuntimeError(f"登录失败，HTTP {status}")
+            cookies = _resp_cookies(resp)
             if not any(k in cookies for k in ("remember_id", "remember", "yuo1", "AVS")):
                 raise RuntimeError("登录响应未包含有效会话 Cookie，请检查账号密码")
             return resp
 
         _retry_with_backoff(login_action)
-        logging.info(f"{label}禁漫登录成功 (用户: {self.username})")
-
-    def _do_sign(self, client):
-        logging.info("正在执行禁漫签到...")
-
-        def sign_action():
-            resp = client.get_jm_html("/ajax/user_daily_sign", timeout=REQUEST_TIMEOUT)
-            return resp
-
-        resp = _retry_with_backoff(sign_action)
-
-        try:
-            data = json.loads(resp.text)
-        except json.JSONDecodeError:
-            logging.warning(f"签到响应非 JSON: {resp.text[:200]}")
-            print("签到状态未知，请检查日志")
-            return
-
-        self._handle_sign_result(data)
-
-    def _handle_sign_result(self, data):
-        if not isinstance(data, dict):
-            print(f"签到状态未知: {data}")
-            return
-
-        # 已经签到过
-        if data.get("error") == "finished":
-            logging.info("今日已签到，无需重复签到")
-            print("签到结果: 今日已签到")
-
-        # AJAX 验证失败 (未登录)
-        elif data.get("errorMsg") == "Not legal.ajax":
-            logging.error("签到失败: AJAX 验证未通过，可能登录态已失效")
-            print("签到失败: 登录验证未通过")
-
-        # 签到成功
-        elif "msg" in data:
-            msg = data["msg"]
-            logging.info(f"禁漫签到成功: {msg}")
-            print(f"签到结果: {msg}")
-
-        # 兜底
-        else:
-            logging.info(f"签到响应: {data}")
-            print(f"签到状态: {data}")
+        logging.info(f"禁漫登录成功 (用户: {self.username})")
 
     @staticmethod
     def _detect_postman_type():
