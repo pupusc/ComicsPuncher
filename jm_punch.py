@@ -129,12 +129,24 @@ class JmPuncher:
         client = self._build_client("api", FALLBACK_API_DOMAINS)
         self._do_login(client)
 
-        # API 客户端没有 get_jm_html()，需要自行发 HTTP 请求签到。
-        # 关键：必须使用 API 域名发签到请求，因为登录 cookies 绑定在 API 域上。
+        # 直接用 API 客户端的 get() 发签到请求。
+        # jmcomic 的 merge_kwargs 机制会自动携带登录时写入 meta_data 的 cookies，
+        # 避免手动转移 cookie 导致的会话丢失。
         domain = client.get_domain_list()[0]
-        cookies = client.get_meta_data('cookies') or {}
         logging.info(f"使用 API 域名 [{domain}] 执行签到")
-        self._do_sign_via_direct_http(domain=domain, cookies=cookies)
+
+        resp = _retry_with_backoff(
+            lambda: client.get(
+                "/ajax/user_daily_sign",
+                timeout=REQUEST_TIMEOUT,
+                headers={
+                    "Referer": f"https://{domain}/",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json, text/plain, */*",
+                },
+            )
+        )
+        self._parse_and_handle(resp.text)
 
     # ============================
     # 策略3: 直接 HTTP（完全不依赖 jmcomic 框架）
